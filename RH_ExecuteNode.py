@@ -13,6 +13,8 @@ import cv2 # <<< Added import for OpenCV
 import safetensors.torch # <<< Added safetensors import
 import torchaudio 
 import torch.nn.functional as F # <<< Add F for padding
+import zipfile
+import shutil
 
 # Try importing ComfyUI video classes safely
 try:
@@ -125,9 +127,9 @@ class ExecuteNode:
             },
         }
 
-    RETURN_TYPES = ("IMAGE", "IMAGE", "LATENT", "STRING", "AUDIO", "VIDEO")
-    RETURN_NAMES = ("images", "video_frames", "latent", "text", "audio", "video")
-    OUTPUT_IS_LIST = (False, False, True, True, True, True)
+    RETURN_TYPES = ("IMAGE", "IMAGE", "IMAGE", "LATENT", "STRING", "AUDIO", "VIDEO")
+    RETURN_NAMES = ("images", "zip_images", "video_frames", "latent", "text", "audio", "video")
+    OUTPUT_IS_LIST = (False, False, False, True, True, True, True)
 
     CATEGORY = "RunningHub"
     FUNCTION = "process"
@@ -714,6 +716,7 @@ class ExecuteNode:
         retry_interval = 1
         max_retry_interval = 5
         image_data_list = [] # <<< For regular images
+        zip_image_data_list = [] # <<< For ZIP images
         frame_data_list = [] # <<< For video frames
         latent_data_list = [] # <<< For latent data
         text_data_list = []   # <<< For text data
@@ -769,6 +772,9 @@ class ExecuteNode:
                                 file_type_lower = file_type.lower()
                                 if file_type_lower in ["png", "jpg", "jpeg", "webp", "bmp", "gif"]:
                                     image_urls.append(file_url)
+                                elif file_type_lower == "zip":
+                                    extracted_tensors = self.download_and_process_zip(file_url)
+                                    zip_image_data_list.extend(extracted_tensors)
                                 elif file_type_lower in ["mp4", "avi", "mov", "webm"]:
                                     # Add to both frame extraction and video output
                                     frame_video_urls.append(file_url)  # For frame extraction
@@ -869,6 +875,53 @@ class ExecuteNode:
                                 print("Only one image found, no normalization needed.")
                                 image_data_list = downloaded_images
                         # else: image_data_list remains empty
+
+                    final_zip_images = []
+                    if zip_image_data_list:
+                        print(f"Processing {len(zip_image_data_list)} images from ZIPs for batching...")
+                        if len(zip_image_data_list) > 1:
+                            # 寻找最大尺寸
+                            max_channels = 0
+                            max_h = 0
+                            max_w = 0
+                            for img in zip_image_data_list:
+                                max_h = max(max_h, img.shape[1])
+                                max_w = max(max_w, img.shape[2])
+                                max_channels = max(max_channels, img.shape[3])
+                            
+                            print(f"ZIP Batch Max dimensions: {max_h}x{max_w}, C={max_channels}")
+                            
+                            # 归一化
+                            for img_tensor in zip_image_data_list:
+                                _, h, w, c = img_tensor.shape
+                                current_img = img_tensor
+                                
+                                # 通道填充
+                                if c < max_channels:
+                                    if c == 3 and max_channels == 4:
+                                        alpha = torch.ones(1, h, w, 1, dtype=current_img.dtype, device=current_img.device)
+                                        current_img = torch.cat([current_img, alpha], dim=3)
+                                    else:
+                                        pad = torch.zeros(1, h, w, max_channels - c, dtype=current_img.dtype, device=current_img.device)
+                                        current_img = torch.cat([current_img, pad], dim=3)
+                                
+                                # 尺寸填充
+                                if h < max_h or w < max_w:
+                                    pad_h = max_h - h
+                                    pad_w = max_w - w
+                                    pad_t = pad_h // 2
+                                    pad_b = pad_h - pad_t
+                                    pad_l = pad_w // 2
+                                    pad_r = pad_w - pad_l
+                                    
+                                    # [1, H, W, C] -> [1, C, H, W] for pad
+                                    img_perm = current_img.permute(0, 3, 1, 2)
+                                    img_perm = F.pad(img_perm, (pad_l, pad_r, pad_t, pad_b), "constant", 0)
+                                    current_img = img_perm.permute(0, 2, 3, 1)
+                                
+                                final_zip_images.append(current_img)
+                        else:
+                            final_zip_images = zip_image_data_list
 
                     # Process Videos (extract frames) -> Add to frame_data_list
                     # Only extract frames if there's a single video; skip for multiple videos to save time
@@ -984,6 +1037,11 @@ class ExecuteNode:
             print("No regular images generated, creating placeholder.")
             image_data_list.append(self.create_placeholder_image(text="No image output"))
 
+        # Placeholder for ZIP images
+        if not final_zip_images:
+            print("No ZIP images generated, creating placeholder.")
+            final_zip_images.append(self.create_placeholder_image(text="No ZIP Image Output"))
+
         # Placeholder for video frames
         if not frame_data_list:
             # Check if we skipped frame extraction due to multiple videos
@@ -1001,9 +1059,10 @@ class ExecuteNode:
 
         # Batch images and frames separately
         final_image_batch = torch.cat(image_data_list, dim=0) if image_data_list else None
+        final_zip_image_batch = torch.cat(final_zip_images, dim=0) if final_zip_images else None
         final_frame_batch = torch.cat(frame_data_list, dim=0) if frame_data_list else None # <<< Batch frames
         
-        return (final_image_batch, final_frame_batch, latent_data_list, text_data_list, audio_data_list, video_data_list) 
+        return (final_image_batch, final_zip_image_batch, final_frame_batch, latent_data_list, text_data_list, audio_data_list, video_data_list) 
 
     def create_placeholder_image(self, text="No image/video output", width=256, height=64, with_alpha=False):
         """Creates a placeholder image tensor with text.
@@ -1727,6 +1786,102 @@ class ExecuteNode:
 
         return processed_audio
 
+    # <<< Add ZIP download and processing function
+    def download_and_process_zip(self, zip_url):
+        """
+        下载 ZIP 文件，解压并读取其中的所有图片，返回图片 Tensor 列表。
+        """
+        max_retries = 5
+        retry_delay = 1
+        zip_path = None
+        extract_dir = None
+        output_dir = "temp"
+        image_tensors = []
+
+        if not os.path.exists(output_dir):
+            try: os.makedirs(output_dir)
+            except OSError: pass
+
+        # --- 1. 下载 ZIP ---
+        for attempt in range(max_retries):
+            zip_path = None
+            try:
+                safe_filename = f"temp_zip_{str(int(time.time()*1000))}.zip"
+                zip_path = os.path.join(output_dir, safe_filename)
+
+                print(f"Downloading ZIP attempt {attempt + 1}: {zip_url}")
+                response = requests.get(zip_url, stream=True, timeout=120) # ZIP可能较大，增加超时
+                response.raise_for_status()
+
+                with open(zip_path, "wb") as f:
+                    for chunk in response.iter_content(chunk_size=65536):
+                        if chunk: f.write(chunk)
+                
+                # 验证是否为有效的 ZIP
+                if zipfile.is_zipfile(zip_path):
+                    break 
+                else:
+                    print("Downloaded file is not a valid zip.")
+                    raise ValueError("Invalid ZIP file")
+
+            except Exception as e:
+                print(f"Zip download failed: {e}")
+                if zip_path and os.path.exists(zip_path):
+                    try: os.remove(zip_path)
+                    except: pass
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay)
+                    retry_delay *= 2
+                else:
+                    return [] # 失败返回空列表
+
+        # --- 2. 解压并读取图片 ---
+        try:
+            extract_dir = os.path.join(output_dir, f"extract_{str(int(time.time()*1000))}")
+            os.makedirs(extract_dir, exist_ok=True)
+            
+            print(f"Extracting zip to {extract_dir}...")
+            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+                zip_ref.extractall(extract_dir)
+            
+            # 遍历文件夹查找图片
+            valid_extensions = {'.png', '.jpg', '.jpeg', '.webp', '.bmp', '.tiff'}
+            
+            for root, dirs, files in os.walk(extract_dir):
+                for file in files:
+                    ext = os.path.splitext(file)[1].lower()
+                    if ext in valid_extensions:
+                        file_path = os.path.join(root, file)
+                        try:
+                            # 使用 PIL 读取
+                            img = Image.open(file_path)
+                            
+                            # 处理 Alpha 通道
+                            if img.mode in ['RGBA', 'LA'] or (img.mode == 'P' and 'transparency' in img.info):
+                                img = img.convert("RGBA")
+                            else:
+                                img = img.convert("RGB")
+                                
+                            img_array = np.array(img).astype(np.float32) / 255.0
+                            img_tensor = torch.from_numpy(img_array)[None,] # [1, H, W, C]
+                            image_tensors.append(img_tensor)
+                            
+                        except Exception as img_e:
+                            print(f"Error reading image inside zip {file}: {img_e}")
+
+        except Exception as e:
+            print(f"Error processing zip file: {e}")
+        finally:
+            # 清理临时文件
+            if zip_path and os.path.exists(zip_path):
+                try: os.remove(zip_path)
+                except: pass
+            if extract_dir and os.path.exists(extract_dir):
+                try: shutil.rmtree(extract_dir)
+                except: pass
+
+        print(f"Found {len(image_tensors)} images in ZIP.")
+        return image_tensors
 
     def check_account_status(self, api_key, base_url):
         """
