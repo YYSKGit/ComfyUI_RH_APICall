@@ -125,8 +125,9 @@ class ExecuteNode:
             },
         }
 
-    RETURN_TYPES = ("IMAGE", "IMAGE", "LATENT", "STRING", "AUDIO", "VIDEO", "VIDEO", "VIDEO", "VIDEO", "VIDEO")
-    RETURN_NAMES = ("images", "video_frames", "latent", "text", "audio", "video1", "video2", "video3", "video4", "video5")
+    RETURN_TYPES = ("IMAGE", "IMAGE", "LATENT", "STRING", "AUDIO", "VIDEO")
+    RETURN_NAMES = ("images", "video_frames", "latent", "text", "audio", "video")
+    OUTPUT_IS_LIST = (False, False, True, True, True, True)
 
     CATEGORY = "RunningHub"
     FUNCTION = "process"
@@ -714,9 +715,9 @@ class ExecuteNode:
         max_retry_interval = 5
         image_data_list = [] # <<< For regular images
         frame_data_list = [] # <<< For video frames
-        latent_data = None
-        text_data = None
-        audio_data = None # <<< For audio data
+        latent_data_list = [] # <<< For latent data
+        text_data_list = []   # <<< For text data
+        audio_data_list = [] # <<< For audio data
         
         # Track consecutive empty results to detect completed tasks with no output
         consecutive_empty_results = 0
@@ -890,66 +891,54 @@ class ExecuteNode:
                                 except Exception as vid_e:
                                     print(f"Error processing video {url}: {vid_e}")
 
-                    # Process Latents (load the first one found)
-                    if latent_urls and latent_data is None:
+                    # Process Latents (load all found)
+                    if latent_urls:
                         print(f"Processing {len(latent_urls)} latent file(s)...")
                         for url in latent_urls:
                              try:
                                  loaded_latent = self.download_and_load_latent(url)
                                  if loaded_latent is not None:
-                                     latent_data = loaded_latent
+                                     latent_data_list.append(loaded_latent)
                                      print(f"Successfully loaded latent from {url}")
-                                     break # Process only the first successful latent
                              except Exception as lat_e:
                                  print(f"Error processing latent {url}: {lat_e}")
 
-                    # Process Text Files (read the first one found)
-                    if text_urls and text_data is None:
+                    # Process Text Files (read all found)
+                    if text_urls:
                         print(f"Processing {len(text_urls)} text file(s)...")
                         for url in text_urls:
                              try:
                                  loaded_text = self.download_and_read_text(url)
                                  if loaded_text is not None:
-                                     text_data = loaded_text
+                                     text_data_list.append(loaded_text)
                                      print(f"Successfully read text from {url}")
-                                     break # Process only the first successful text file
                              except Exception as txt_e:
                                  print(f"Error processing text file {url}: {txt_e}")
 
-                    # <<< Process Audio Files (load the first one found)
-                    if audio_urls and audio_data is None:
+                    # <<< Process Audio Files (load all found)
+                    if audio_urls:
                         print(f"Processing {len(audio_urls)} audio file(s)...")
                         for url in audio_urls:
                              try:
                                  loaded_audio = self.download_and_process_audio(url)
                                  if loaded_audio is not None:
-                                     audio_data = loaded_audio
+                                     audio_data_list.append(loaded_audio)
                                      print(f"Successfully processed audio from {url}")
-                                     break # Process only the first successful audio file
                              except Exception as aud_e:
                                  print(f"Error processing audio file {url}: {aud_e}")
 
-                    # <<< Process Video Files (download up to 5 mp4 files for VIDEO outputs)
-                    video_data_list = []  # Store up to 5 video objects
+                    # <<< Process Video Files (download all mp4 files for VIDEO outputs)
+                    video_data_list = []  # Store all video objects
                     if video_urls and video_support_available:
-                        num_videos = len(video_urls)
-                        max_videos = 5
-                        videos_to_process = min(num_videos, max_videos)
-                        
-                        print(f"Processing {videos_to_process} mp4 video file(s) for VIDEO output (total found: {num_videos})...")
-                        
-                        for i, url in enumerate(video_urls[:max_videos]):  # Take only first 5
+                        for url in video_urls:
                              try:
                                  video_path = self.download_video_for_output(url)
                                  if video_path is not None:
                                      video_obj = VideoFromFile(video_path)
                                      video_data_list.append(video_obj)
-                                     print(f"Successfully created VIDEO output {i+1} from {url}")
+                                     print(f"Successfully created VIDEO output from {url}")
                              except Exception as vid_e:
                                  print(f"Error processing video file {url}: {vid_e}")
-                        
-                        if num_videos > max_videos:
-                            print(f"Note: {num_videos - max_videos} additional video(s) were ignored (max 5 videos supported)")
                     elif video_urls and not video_support_available:
                         print(f"Found {len(video_urls)} mp4 files but VIDEO support not available")
 
@@ -1004,68 +993,17 @@ class ExecuteNode:
             else:
                 print("No video frames generated, creating placeholder.")
                 frame_data_list.append(self.create_placeholder_image(text="No video frame output"))
-
-        # Placeholder for latent
-        if latent_data is None:
-            print("No latent generated, creating placeholder.")
-            latent_data = self.create_placeholder_latent()
-
-        # Default for text
-        if text_data is None:
-             print("No text file processed, returning 'null' string.")
-             text_data = "null"
-             
-        # <<< Placeholder for audio
-        if audio_data is None:
-            print("No audio generated, creating placeholder.")
-            audio_data = self.create_placeholder_audio()
-
-        # <<< Prepare 5 video outputs (video1-video5)
-        # Ensure video_data_list exists
-        if 'video_data_list' not in locals():
-            video_data_list = []
         
-        # Pad video_data_list to exactly 5 elements with placeholder videos
-        print(f"Preparing video outputs: {len(video_data_list)} video(s) available")
-        while len(video_data_list) < 5:
-            # Create placeholder video for empty slots
-            placeholder_video = self.create_placeholder_video()
-            video_data_list.append(placeholder_video)
-        
-        # Take only first 5 (in case somehow more were added)
-        video_data_list = video_data_list[:5]
-        
-        video1, video2, video3, video4, video5 = video_data_list
-        
-        # Print summary of video outputs
-        real_video_count = sum(1 for v in [video1, video2, video3, video4, video5] if v is not None and not (hasattr(v, 'path') and 'placeholder' in v.path))
-        if real_video_count > 0:
-            print(f"Returning {real_video_count} real video output(s) and {5 - real_video_count} placeholder(s) across video1-video5")
-        else:
-            print("No real videos generated, all 5 video outputs will use placeholders.")
+        if not latent_data_list: latent_data_list = [self.create_placeholder_latent()]
+        if not text_data_list: text_data_list = ["No text output"]
+        if not audio_data_list: audio_data_list = [self.create_placeholder_audio()]
+        if not video_data_list: video_data_list = [self.create_placeholder_video()]
 
         # Batch images and frames separately
         final_image_batch = torch.cat(image_data_list, dim=0) if image_data_list else None
         final_frame_batch = torch.cat(frame_data_list, dim=0) if frame_data_list else None # <<< Batch frames
-
-        # Ensure we return a tuple matching RETURN_TYPES
-        # <<< Add audio_data to the return tuple
-        # Debug: Check audio_data before returning (ComfyUI expects 3D: [batch, channels, samples])
-        if audio_data is not None and "waveform" in audio_data:
-            waveform = audio_data['waveform']
-            print(f"DEBUG: Final audio waveform shape: {waveform.shape}")
-            print(f"DEBUG: Final audio waveform ndim: {waveform.ndim}")
-            print(f"DEBUG: Final audio waveform dtype: {waveform.dtype}")
-            
-            # Verify ComfyUI standard format
-            if waveform.ndim == 3:
-                print(f"DEBUG: ✓ Correct ComfyUI format [batch={waveform.shape[0]}, channels={waveform.shape[1]}, samples={waveform.shape[2]}]")
-            else:
-                print(f"DEBUG: ✗ Unexpected format - ComfyUI expects 3D [batch, channels, samples]")
-        else:
-            print(f"DEBUG: audio_data is None or missing waveform key")
         
-        return (final_image_batch, final_frame_batch, latent_data, text_data, audio_data, video1, video2, video3, video4, video5) 
+        return (final_image_batch, final_frame_batch, latent_data_list, text_data_list, audio_data_list, video_data_list) 
 
     def create_placeholder_image(self, text="No image/video output", width=256, height=64, with_alpha=False):
         """Creates a placeholder image tensor with text.
