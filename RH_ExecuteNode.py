@@ -15,6 +15,7 @@ import torchaudio
 import torch.nn.functional as F # <<< Add F for padding
 import zipfile
 import shutil
+import comfy.model_management
 
 # Try importing ComfyUI video classes safely
 try:
@@ -599,6 +600,22 @@ class ExecuteNode:
 
             # Main wait loop
             while True: # <<< Modified loop structure
+                # 0. 主动检测 ComfyUI 中断信号
+                try:
+                    comfy.model_management.throw_exception_if_processing_interrupted()
+                except Exception as interrupt_e:
+                    # 捕获到中断信号，执行云端取消逻辑
+                    print(f"\n!!! User interrupted execution. Cancelling remote task {task_id} !!!")
+                    # self.cancel_task(task_id, api_key, base_url)
+                    
+                    # 标记任务状态以退出（虽然 raise 会直接跳出，但为了安全更新状态）
+                    with self.node_lock:
+                        self.task_completed = True
+                        self.ws_error = interrupt_e
+                    
+                    # 必须重新抛出异常，以便 ComfyUI 知道节点已停止
+                    raise interrupt_e
+
                 # 1. Check completion flags (set by WS handlers or polling)
                 with self.node_lock:
                      is_completed = self.task_completed
