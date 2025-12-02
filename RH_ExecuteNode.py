@@ -606,7 +606,7 @@ class ExecuteNode:
                 except Exception as interrupt_e:
                     # 捕获到中断信号，执行云端取消逻辑
                     print(f"\n!!! User interrupted execution. Cancelling remote task {task_id} !!!")
-                    # self.cancel_task(task_id, api_key, base_url)
+                    self.cancel_task(task_id, api_key, base_url)
                     
                     # 标记任务状态以退出（虽然 raise 会直接跳出，但为了安全更新状态）
                     with self.node_lock:
@@ -2172,6 +2172,36 @@ class ExecuteNode:
         # Should not be reachable if logic is correct
         raise Exception("AI App Task creation failed unexpectedly after retry loop.")
 
+    def cancel_task(self, task_id, api_key, base_url):
+        """
+        Sends a request to the cloud API to cancel the running task.
+        """
+        if not task_id or not api_key or not base_url:
+            print("Missing parameters for cancellation, skipping remote cancel.")
+            return
+
+        url = f"{base_url}/task/openapi/cancel" 
+        
+        headers = {
+            "User-Agent": "ComfyUI-RH-APICall-Node/1.0",
+            "Content-Type": "application/json",
+        }
+        data = {"taskId": task_id, "apiKey": api_key}
+
+        try:
+            print(f"Attempting to cancel remote task {task_id}...")
+            response = requests.post(url, json=data, headers=headers, timeout=10)
+            
+            if response.status_code == 200:
+                result = response.json()
+                if result.get("code") == 0:
+                    print(f"Remote task {task_id} cancelled successfully.")
+                else:
+                    print(f"Remote cancel failed (API Error): {result.get('msg')}")
+            else:
+                print(f"Remote cancel failed: HTTP {response.status_code}")
+        except Exception as e:
+            print(f"Error sending cancellation request: {e}")
 
     def check_task_status(self, task_id, api_key, base_url):
         """
