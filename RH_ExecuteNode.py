@@ -124,6 +124,7 @@ class ExecuteNode:
                 "concurrency_limit": ("INT", {"default": 1, "min": 1, "max": 100}), # Restored min/max
                 "is_webapp_task": ("BOOLEAN", {"default": False}),
                 "use_rtx4090_48g": ("BOOLEAN", {"default": False}),
+                "zip_password": ("STRING", {"default": ""}),
             },
         }
 
@@ -386,7 +387,7 @@ class ExecuteNode:
         raise Exception(f"Failed to get workflow node count after {max_retries} attempts (unexpected loop end). Last error: {last_exception}")
 
     # --- Main Process Method ---
-    def process(self, apiConfig, nodeInfoList=None, run_timeout=600, concurrency_limit=1, is_webapp_task=False, use_rtx4090_48g=False):
+    def process(self, apiConfig, nodeInfoList=None, run_timeout=600, concurrency_limit=1, is_webapp_task=False, use_rtx4090_48g=False, zip_password=""):
         # Reset state
         with self.node_lock: # Use lock for resetting shared state
             self.executed_nodes.clear()
@@ -708,9 +709,9 @@ class ExecuteNode:
         # --- Process Output ---
         print("Processing task output...")
         # Pass the validated api_key and base_url again
-        return self.process_task_output(task_id, api_key, base_url)
+        return self.process_task_output(task_id, api_key, base_url, zip_password)
 
-    def process_task_output(self, task_id, api_key, base_url):
+    def process_task_output(self, task_id, api_key, base_url, zip_password=""):
         """Handles task output, separating images, video frames, audio, etc."""
         max_retries = 30
         retry_interval = 1
@@ -773,7 +774,7 @@ class ExecuteNode:
                                 if file_type_lower in ["png", "jpg", "jpeg", "webp", "bmp", "gif"]:
                                     image_urls.append(file_url)
                                 elif file_type_lower == "zip":
-                                    extracted_tensors = self.download_and_process_zip(file_url)
+                                    extracted_tensors = self.download_and_process_zip(file_url, zip_password)
                                     zip_image_data_list.extend(extracted_tensors)
                                 elif file_type_lower in ["mp4", "avi", "mov", "webm"]:
                                     # Add to both frame extraction and video output
@@ -1787,9 +1788,10 @@ class ExecuteNode:
         return processed_audio
 
     # <<< Add ZIP download and processing function
-    def download_and_process_zip(self, zip_url):
+    def download_and_process_zip(self, zip_url, password=""):
         """
         下载 ZIP 文件，解压并读取其中的所有图片，返回图片 Tensor 列表。
+        支持密码解压（建议安装 pyzipper 以支持 AES256）。
         """
         max_retries = 5
         retry_delay = 1
@@ -1841,8 +1843,31 @@ class ExecuteNode:
             os.makedirs(extract_dir, exist_ok=True)
             
             print(f"Extracting zip to {extract_dir}...")
-            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-                zip_ref.extractall(extract_dir)
+            
+            # 处理密码编码
+            pwd_bytes = None
+            if password:
+                pwd_bytes = password.encode('utf-8')
+            
+            # 尝试使用 pyzipper 以支持 AES 解密，如果未安装则回退到 zipfile
+            try:
+                import pyzipper
+                ZipContext = pyzipper.AESZipFile
+                print("Using pyzipper for extraction (AES support enabled).")
+            except ImportError:
+                ZipContext = zipfile.ZipFile
+                if password:
+                    print("Warning: pyzipper not installed. AES encrypted ZIPs may fail. Install via 'pip install pyzipper'.")
+
+            # 使用选定的 Context 打开并解压
+            with ZipContext(zip_path, 'r') as zip_ref:
+                # 传入密码进行解压
+                try:
+                    zip_ref.extractall(extract_dir, pwd=pwd_bytes)
+                except RuntimeError as e:
+                    if "Bad password" in str(e) or "password" in str(e).lower():
+                        print(f"Error: Password incorrect or encryption method not supported (Try installing pyzipper).")
+                    raise e
             
             # 遍历文件夹查找图片
             valid_extensions = {'.png', '.jpg', '.jpeg', '.webp', '.bmp', '.tiff'}
