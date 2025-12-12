@@ -130,7 +130,7 @@ class ExecuteNode:
         }
 
     RETURN_TYPES = ("IMAGE", "IMAGE", "IMAGE", "LATENT", "STRING", "AUDIO", "VIDEO", "VIDEO")
-    RETURN_NAMES = ("images", "zip_images", "video_frames", "latent", "text", "audio", "video", "zip_videos")
+    RETURN_NAMES = ("images", "zip_images", "video_frames", "latent", "text", "audio", "video", "zip_video")
     OUTPUT_IS_LIST = (False, False, False, True, True, True, True, True)
 
     CATEGORY = "RunningHub"
