@@ -129,9 +129,9 @@ class ExecuteNode:
             },
         }
 
-    RETURN_TYPES = ("IMAGE", "IMAGE", "IMAGE", "LATENT", "STRING", "AUDIO", "VIDEO")
-    RETURN_NAMES = ("images", "zip_images", "video_frames", "latent", "text", "audio", "video")
-    OUTPUT_IS_LIST = (False, False, False, True, True, True, True)
+    RETURN_TYPES = ("IMAGE", "IMAGE", "IMAGE", "LATENT", "STRING", "AUDIO", "VIDEO", "VIDEO")
+    RETURN_NAMES = ("images", "zip_images", "video_frames", "latent", "text", "audio", "video", "zip_videos")
+    OUTPUT_IS_LIST = (False, False, False, True, True, True, True, True)
 
     CATEGORY = "RunningHub"
     FUNCTION = "process"
@@ -735,6 +735,7 @@ class ExecuteNode:
         max_retry_interval = 5
         image_data_list = [] # <<< For regular images
         zip_image_data_list = [] # <<< For ZIP images
+        zip_video_data_list = [] # <<< For ZIP videos
         frame_data_list = [] # <<< For video frames
         latent_data_list = [] # <<< For latent data
         text_data_list = []   # <<< For text data
@@ -791,8 +792,9 @@ class ExecuteNode:
                                 if file_type_lower in ["png", "jpg", "jpeg", "webp", "bmp", "gif"]:
                                     image_urls.append(file_url)
                                 elif file_type_lower == "zip":
-                                    extracted_tensors = self.download_and_process_zip(file_url, zip_password)
+                                    extracted_tensors, extracted_videos = self.download_and_process_zip(file_url, zip_password)
                                     zip_image_data_list.extend(extracted_tensors)
+                                    zip_video_data_list.extend(extracted_videos)
                                 elif file_type_lower in ["mp4", "avi", "mov", "webm"]:
                                     # Add to both frame extraction and video output
                                     frame_video_urls.append(file_url)  # For frame extraction
@@ -1060,6 +1062,11 @@ class ExecuteNode:
             print("No ZIP images generated, creating placeholder.")
             final_zip_images.append(self.create_placeholder_image(text="No ZIP Image Output"))
 
+        # Placeholder for ZIP videos
+        if not zip_video_data_list:
+            print("No ZIP videos generated, creating placeholder.")
+            zip_video_data_list.append(self.create_placeholder_video())
+
         # Placeholder for video frames
         if not frame_data_list:
             # Check if we skipped frame extraction due to multiple videos
@@ -1080,7 +1087,7 @@ class ExecuteNode:
         final_zip_image_batch = torch.cat(final_zip_images, dim=0) if final_zip_images else None
         final_frame_batch = torch.cat(frame_data_list, dim=0) if frame_data_list else None # <<< Batch frames
         
-        return (final_image_batch, final_zip_image_batch, final_frame_batch, latent_data_list, text_data_list, audio_data_list, video_data_list) 
+        return (final_image_batch, final_zip_image_batch, final_frame_batch, latent_data_list, text_data_list, audio_data_list, video_data_list, zip_video_data_list) 
 
     def create_placeholder_image(self, text="No image/video output", width=256, height=64, with_alpha=False):
         """Creates a placeholder image tensor with text.
@@ -1807,8 +1814,8 @@ class ExecuteNode:
     # <<< Add ZIP download and processing function
     def download_and_process_zip(self, zip_url, password=""):
         """
-        下载 ZIP 文件，解压并读取其中的所有图片，返回图片 Tensor 列表。
-        支持密码解压（建议安装 pyzipper 以支持 AES256）。
+        下载 ZIP 文件，解压并读取其中的所有图片和视频。
+        返回 (image_tensors, video_objects) 元组。
         """
         max_retries = 5
         retry_delay = 1
@@ -1816,6 +1823,7 @@ class ExecuteNode:
         extract_dir = None
         output_dir = "temp"
         image_tensors = []
+        video_objects = []
 
         if not os.path.exists(output_dir):
             try: os.makedirs(output_dir)
@@ -1852,9 +1860,9 @@ class ExecuteNode:
                     time.sleep(retry_delay)
                     retry_delay *= 2
                 else:
-                    return [] # 失败返回空列表
+                    return [], [] # 失败返回两个空列表
 
-        # --- 2. 解压并读取图片 ---
+        # --- 2. 解压并读取内容 ---
         try:
             extract_dir = os.path.join(output_dir, f"extract_{str(int(time.time()*1000))}")
             os.makedirs(extract_dir, exist_ok=True)
@@ -1886,14 +1894,16 @@ class ExecuteNode:
                         print(f"Error: Password incorrect or encryption method not supported (Try installing pyzipper).")
                     raise e
             
-            # 遍历文件夹查找图片
-            valid_extensions = {'.png', '.jpg', '.jpeg', '.webp', '.bmp', '.tiff'}
+            # 遍历文件夹查找图片和视频
+            valid_image_extensions = {'.png', '.jpg', '.jpeg', '.webp', '.bmp', '.tiff'}
+            valid_video_extensions = {'.mp4', '.mov', '.avi', '.webm', '.mkv'}
             
             for root, dirs, files in os.walk(extract_dir):
                 for file in files:
                     ext = os.path.splitext(file)[1].lower()
-                    if ext in valid_extensions:
-                        file_path = os.path.join(root, file)
+                    file_path = os.path.join(root, file)
+
+                    if ext in valid_image_extensions:
                         try:
                             # 使用 PIL 读取
                             img = Image.open(file_path)
@@ -1910,6 +1920,24 @@ class ExecuteNode:
                             
                         except Exception as img_e:
                             print(f"Error reading image inside zip {file}: {img_e}")
+                    
+                    elif ext in valid_video_extensions and video_support_available:
+                        try:
+                            # 生成一个新的持久文件名
+                            new_video_filename = f"zip_video_{str(int(time.time()*1000))}_{file}"
+                            new_video_filename = "".join(c if c.isalnum() or c in ['.', '_', '-'] else '_' for c in new_video_filename)[:150]
+                            target_path = os.path.join(output_dir, new_video_filename)
+                            
+                            # 移动文件
+                            shutil.move(file_path, target_path)
+                            print(f"Extracted video from ZIP and moved to: {target_path}")
+
+                            # 创建 VideoFromFile 对象
+                            video_obj = VideoFromFile(target_path)
+                            video_objects.append(video_obj)
+
+                        except Exception as vid_e:
+                            print(f"Error extracting/processing video inside zip {file}: {vid_e}")
 
         except Exception as e:
             print(f"Error processing zip file: {e}")
@@ -1922,8 +1950,8 @@ class ExecuteNode:
                 try: shutil.rmtree(extract_dir)
                 except: pass
 
-        print(f"Found {len(image_tensors)} images in ZIP.")
-        return image_tensors
+        print(f"Found {len(image_tensors)} images and {len(video_objects)} videos in ZIP.")
+        return image_tensors, video_objects
 
     def check_account_status(self, api_key, base_url):
         """
